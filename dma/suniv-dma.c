@@ -82,7 +82,7 @@
 
 /* Bits of DMA Configure Register */
 #define SUNIV_DMA_LOADING               BIT(31)
-#define SUNIV_DMA_BUSY_OFFSET           30
+#define SUNIV_DMA_BUSY                  BIT(30)
 #define SUNIV_DMA_CONTINUOUS_MODE_EN    BIT(29)
 #define SUNIV_DMA_WAIT_STATE_OFFSET     26
 #define SUNIV_DMA_DES_DATAWIDTH_OFFSET  24
@@ -94,8 +94,6 @@
 #define SUNIV_DMA_SRC_BRUST_LEN_OFFSET  7
 #define SUNIV_DMA_SRC_ADDR_TYPE_OFFSET  5
 #define SUNIV_DMA_SRC_DRQ_TYPE_OFFSET   0
-
-
 
 /* Suniv DMA direction */
 #define SUNIV_DMA_MEM_TO_MEM        0x00
@@ -126,6 +124,9 @@ enum suniv_dma_busrt_len {
     SUNIV_DMA_BURST_4,
 };
 
+/*
+ * Hardware configuration of dma channel
+ */
 struct suniv_dma_chn_hw {
     u32 busy;
     dma_addr_t src_addr;
@@ -137,12 +138,17 @@ struct suniv_dma_chn_hw {
     u32 cfg;
 };
 
+/*
+ * description of current dma channel
+ */
 struct suniv_dma_desc {
     struct suniv_dma_chn_hw      chan_hw;
     struct virt_dma_desc         vdesc;
+
     enum dma_transfer_direction  dir;
 };
 
+/* this struct stores everything we need for dma work */
 struct suniv_dma_chan {
     u32 id;
     bool is_dedicated;
@@ -178,7 +184,7 @@ static inline void suniv_dma_write(struct suniv_dma *dma_dev, u32 reg, u32 val)
     writel(val, dma_dev->base + reg);
 }
 
-static inline void suniv_dma_update(struct suniv_dma *dma_dev, u32 reg, 
+static inline void suniv_dma_update(struct suniv_dma *dma_dev, u32 reg,
                                     u32 mask, u32 val)
 {
     u32 dump_val = readl(dma_dev->base + reg);
@@ -213,17 +219,28 @@ static int suniv_dma_enable(struct suniv_dma *dma_dev)
     int rc;
 
     rc = clk_prepare_enable(dma_dev->hclk);
-    if (rc)
+    if (rc) {
+        dev_err(dma_dev->ddev.dev, "can't enable AHB clock!\n");
         return rc;
+    }
 
     rc = clk_prepare_enable(dma_dev->mclk);
-    if (rc)
+    if (rc) {
+        dev_err(dma_dev->ddev.dev, "can't enable module clock!\n");
         return rc;
+    }
 
-    rc = reset_control_deassert(dma_dev->rstc);
-    if (rc)
+    rc = reset_control_assert(dma_dev->rstc);
+    if (rc) {
+        dev_err(dma_dev->ddev.dev, "can't assert the device from device!\n");
         return rc;
+    };
 
+    /* A reset is in need */
+    pr_debug("%s: reset the dma controller\n", __func__);
+    reset_control_reset(dma_dev->rstc);
+
+    /* initialize interrupt config */
     suniv_dma_write(dma_dev, SUNIV_DMA_INT_CTRL_REG, 0);
     suniv_dma_write(dma_dev, SUNIV_DMA_INT_STA_REG, 0xFFFFFFFF);
 
@@ -238,6 +255,10 @@ static void suniv_dma_disable(struct suniv_dma *dma_dev)
     reset_control_assert(dma_dev->rstc);
 }
 
+/*
+ * This routine is used to control the interrupt
+ * of each hardware dma channel
+ */
 static void suniv_dma_set_interurpt(struct suniv_dma *dma_dev,
                                     struct suniv_dma_chan *chan,
                                     u32 end)
@@ -264,12 +285,40 @@ static void suniv_dma_set_interurpt(struct suniv_dma *dma_dev,
     spin_unlock_irqrestore(&dma_dev->lock, flags);
 }
 
+static bool suniv_dma_check_trans_done(struct suniv_dma_chan *sdc)
+{
+    struct suniv_dma *dma_dev = to_suniv_dma_by_sdc(sdc);
+    u32 status;
+
+    /*
+     * According to the user manual, we should check the
+     * bit 29 of config register of current dma channel
+     * to know if DMA process is finished, but this bit
+     * is used for setting if DMA in continuous mode.
+     *
+     * Otherwise, the bit 30 is used to check DMA channel
+     * is busy, we do this check routine here.
+     */
+    if (sdc->is_dedicated)
+        status = suniv_dma_read(dma_dev, SUNIV_DDMA_CFG_REG(sdc->id));
+    else
+        status = suniv_dma_read(dma_dev, SUNIV_NDMA_CFG_REG(sdc->id));
+
+    if (status & SUNIV_DMA_BUSY)
+        return false;
+
+    return true;
+}
+
+/* The interrupt service routine of dma channel */
 static irqreturn_t suniv_dma_isr(int irq, void *devid)
 {
     struct suniv_dma *dma_dev = (struct suniv_dma *)devid;
     struct suniv_dma_chan *chan;
     int bit;
-    //u32 remain_bytes;
+    u32 mask;
+    bool trans_done = false;
+
     unsigned long irq_pending = suniv_dma_read(dma_dev, SUNIV_DMA_INT_STA_REG);
 
     printk("%s, irq_pending: 0x%lx\n", __func__, irq_pending);
@@ -277,25 +326,27 @@ static irqreturn_t suniv_dma_isr(int irq, void *devid)
         chan = &dma_dev->chan[bit >> 1];
 
         if (bit & 1) {
-            /* TODO: Disable chann IRQ */
             spin_lock(&dma_dev->lock);
+
             suniv_dma_set_interurpt(dma_dev, chan, 0);
 
+            mask =  chan->is_dedicated ? \
+                    SUNIV_DDMA_FULL_TRANS_INT_PENDING(chan->id) : \
+            		SUNIV_NDMA_FULL_TRANS_INT_PENDING(chan->id);
 
-            /* TODO: Clear chann Interrupt Pending */
-         	suniv_dma_update(dma_dev, SUNIV_DMA_INT_STA_REG, 
-            				chan->is_dedicated?
-            				SUNIV_DDMA_FULL_TRANS_INT_PENDING(chan->id): 
-            				SUNIV_NDMA_FULL_TRANS_INT_PENDING(chan->id), 
-                            chan->is_dedicated?
-            				SUNIV_DDMA_FULL_TRANS_INT_PENDING(chan->id): 
-            				SUNIV_NDMA_FULL_TRANS_INT_PENDING(chan->id));
+            trans_done = suniv_dma_check_trans_done(chan);
+            if (trans_done == true) {
+                vchan_cookie_complete(&chan->desc->vdesc);
+            }
+            printk("%s, check transmit state : %s", __func__, trans_done?"idle":"busy");
 
-            
+            /* set 1 to clear the interrupt pending */
+         	suniv_dma_update(dma_dev,SUNIV_DMA_INT_STA_REG, mask, mask);
+
             spin_unlock(&dma_dev->lock);
         }
     }
-    
+
     return IRQ_HANDLED;
 }
 
@@ -307,13 +358,15 @@ static void suniv_dma_set_chn_config(struct suniv_dma_chan *schan, struct suniv_
     /* A bunch of `suniv_dma_write` here, config current dma channel */
     if (schan->is_dedicated) {
         printk("%s, Configuring DDMA chann: %d \n", __func__, schan->id);
+        printk("%s, src : %u dst : %u  len : %d", __func__ ,hw->src_addr, hw->des_addr, hw->byte_cnt);
         suniv_dma_write(dma_dev, SUNIV_DDMA_SRC_ADR_REG(schan->id), hw->src_addr);
         suniv_dma_write(dma_dev, SUNIV_DDMA_DES_ADR_REG(schan->id), hw->des_addr);
         suniv_dma_write(dma_dev, SUNIV_DDMA_BYTE_CNT_REG(schan->id), hw->byte_cnt);
-        suniv_dma_write(dma_dev, SUNIV_DDMA_CFG_REG(schan->id), hw->byte_cnt);
+        suniv_dma_write(dma_dev, SUNIV_DDMA_CFG_REG(schan->id), hw->cfg);
 
     } else {
         printk("%s, Configuring NDMA chann: %d \n", __func__, schan->id);
+        printk("%s, src : %u dst : %u  len : %d", __func__ ,hw->src_addr, hw->des_addr, hw->byte_cnt);
         suniv_dma_write(dma_dev, SUNIV_NDMA_SRC_ADR_REG(schan->id), hw->src_addr);
         suniv_dma_write(dma_dev, SUNIV_NDMA_DES_ADR_REG(schan->id), hw->des_addr);
         suniv_dma_write(dma_dev, SUNIV_NDMA_BYTE_CNT_REG(schan->id), hw->byte_cnt);
@@ -371,7 +424,33 @@ static enum dma_status suniv_dma_tx_status(struct dma_chan *chan,
                                dma_cookie_t cookie,
                                struct dma_tx_state *txstate)
 {
-    printk("%s\n", __func__);
+    struct suniv_dma_chan *sdc = to_suniv_dma_chan(chan);
+    struct suniv_dma *dma_dev = to_suniv_dma_by_dc(chan);
+    struct suniv_dma_chn_hw *hw;
+    struct suniv_dma_desc *desc;
+    struct virt_dma_desc *vd;
+    unsigned long flags;
+    u32 pos;
+    int rc;
+
+    rc = dma_cookie_status(chan, cookie, txstate);
+    if (rc == DMA_COMPLETE || !txstate)
+        return rc;
+
+    spin_lock_irqsave(&dma_dev->lock, flags);
+
+    vd = vchan_find_desc(&sdc->vchan, cookie);
+    if (!vd)
+        goto exit;
+
+    desc = to_suniv_dma_desc(vd);
+    hw = &desc->chan_hw;
+    pos = hw->byte_cnt;
+
+exit:
+    dma_set_residue(txstate, pos);
+    spin_unlock_irqrestore(&dma_dev->lock, flags);
+
     return 0;
 }
 
@@ -418,7 +497,7 @@ static struct dma_async_tx_descriptor *suniv_dma_prep_dma_memcpy(
         hw->brust_len = SUNIV_DMA_BURST_1;
     }
 */
-    hw->datawidth = SUNIV_DMA_4_BYTE;
+    hw->datawidth = SUNIV_DMA_1_BYTE;
     hw->brust_len = SUNIV_DMA_BURST_1;
     if (chan->is_dedicated) {
         hw->byte_cnt = len & SUNIV_DDMA_BYET_CNT_MASK;
@@ -547,11 +626,13 @@ static int suniv_dma_probe(struct platform_device *pdev)
     /* set private data */
     platform_set_drvdata(pdev, dma_dev);
 
+    /* enable clks and reset dma controller */
     rc = suniv_dma_enable(dma_dev);
     if (rc) {
         dev_err(&pdev->dev, "enable suniv dma failed:%d", rc);
         return rc;
     }
+    pr_debug("%s, suniv dma is enabled\n", __func__);
 
     rc = dma_async_device_register(dd);
     if (rc) {
