@@ -5,10 +5,10 @@
 # users kernel dir
 KERN_DIR:=/home/developer/sources/HamsterBear/software/bsp/linux-5.17.2
 
-MODULE_NAME:=suniv-dma
+MODULE_NAME:=test-dma
 
 all:
-	make -C $(KERN_DIR) M=`pwd` modules 
+	make -C $(KERN_DIR) M=`pwd` modules
 
 clean:
 	make -C $(KERN_DIR) M=`pwd` modules clean
@@ -22,5 +22,4 @@ rmmod: $(MODULE_NAME.ko)
 	./klogcat.sh
 
 CFLAGS_$(MODULE_NAME).o := -DDEBUG
-obj-m += $(MODULE_NAME).o
-obj-m += test-dma-memcpy.o
+obj-m+=$(MODULE_NAME).o
