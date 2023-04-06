@@ -138,6 +138,12 @@ struct suniv_dma_chn_hw {
     u32 cfg;
 };
 
+struct suniv_dma_diagnosis {
+    u32 cid;
+
+    struct suniv_dma_chn_hw reg;
+};
+
 /*
  * description of current dma channel
  */
@@ -167,6 +173,7 @@ struct suniv_dma {
     int                     irq;
 
     spinlock_t              lock;
+    struct mutex            mutex;
 
     struct dma_device       ddev;
 
@@ -176,6 +183,9 @@ struct suniv_dma {
 
     struct suniv_dma_chan   chan[SUNIV_DMA_MAX_CHANNELS];
     u32                     nr_channels;
+
+    /* for dev attr */
+    struct suniv_dma_diagnosis diag;
 };
 
 static inline u32 suniv_dma_read(struct suniv_dma *dma_dev, u32 reg)
@@ -280,8 +290,14 @@ static void __maybe_unused suniv_dma_reg_dump(struct suniv_dma_chan *sdc)
         reg_byte = suniv_dma_read(dma_dev, SUNIV_NDMA_BYTE_CNT_REG(sdc->id));
     }
 
+    /* store diagnosis data */
+    dma_dev->diag.reg.cfg      = reg_cfg;
+    dma_dev->diag.reg.src_addr = reg_src;
+    dma_dev->diag.reg.des_addr = reg_dst;
+    dma_dev->diag.reg.byte_cnt = reg_byte;
+
     printk("======================== SUNIV DMA DUMP =======================\n");
-    printk("\t\t\ttype : %s", sdc->is_dedicated ? "DDMA" : "NDMA");
+    printk("\t\t\tid : %d type : %s", sdc->id, sdc->is_dedicated ? "DDMA" : "NDMA");
     printk("\t\t Interrupt control : 0x%x", reg_intc);
     printk("\t\t Interrupt pending : 0x%x", reg_intp);
     printk("\t\t Channel config : 0x%x", reg_cfg);
@@ -291,33 +307,89 @@ static void __maybe_unused suniv_dma_reg_dump(struct suniv_dma_chan *sdc)
     printk("======================== SUNIV DMA DUMP =======================\n");
 }
 
-static ssize_t suniv_dma_channel_reg_show(struct device *dev, struct device_attribute *attr,
-			                        char *buf)
+static ssize_t suniv_dma_channel_num_show(struct device *dev,
+                                          struct device_attribute *attr,
+                                          char *buf)
 {
+    struct suniv_dma *dma_dev = dev_get_drvdata(dev);
+    struct suniv_dma_diagnosis *diag = &dma_dev->diag;
+    int rc;
+
+    rc = sprintf(buf, "%d", diag->cid);
+
+    return rc;
+}
+
+static ssize_t suniv_dma_channel_num_store(struct device *dev,
+                                           struct device_attribute *attr,
+                                           const char *buf, size_t count)
+{
+    struct suniv_dma *dma_dev = dev_get_drvdata(dev);
+    struct suniv_dma_diagnosis *diag = &dma_dev->diag;
+    u32 cid;
+    int rc;
+
+    mutex_lock(&dma_dev->mutex);
+
+    rc = sscanf(buf, "%d", &cid);
+
+    printk("%s, %d\n", __func__, cid);
+
+    if (0 <= cid && cid < SUNIV_DMA_MAX_CHANNELS) {
+        diag->cid = cid;
+    } else {
+        printk("%s, channel range should between 0 ~ 7\n", __func__);
+        return -EINVAL;
+    }
+
+    mutex_unlock(&dma_dev->mutex);
+
+    return count;
+}
+static DEVICE_ATTR(channel, S_IRUSR | S_IWUSR, suniv_dma_channel_num_show,
+                   suniv_dma_channel_num_store);
+
+static ssize_t suniv_dma_channel_reg_show(struct device *dev,
+                                          struct device_attribute *attr,
+                                          char *buf)
+{
+    struct suniv_dma *dma_dev = dev_get_drvdata(dev);
+    struct suniv_dma_diagnosis *diag = &dma_dev->diag;
+    struct suniv_dma_chan *sdc = &(dma_dev->chan[diag->cid]);
+
+    mutex_lock(&dma_dev->mutex);
+    suniv_dma_reg_dump(sdc);
+    mutex_unlock(&dma_dev->mutex);
+
     return 0;
 }
-// static ssize_t suniv_dma_channel_reg_store(struct device *dev, struct device_attribute *attr,
-// 			                        const char *buf, size_t count);
+// static ssize_t suniv_dma_channel_reg_store(struct device *dev,
+//                                            struct device_attribute *attr,
+//                                            const char *buf, size_t count)
 // {
-
+//     return 0;
 // }
-static DEVICE_ATTR(dump_register, S_IRUSR | S_IWUSR, suniv_dma_channel_reg_show, NULL);
+static DEVICE_ATTR(dump_register, S_IRUSR | S_IWUSR, suniv_dma_channel_reg_show,
+                   NULL);
 
 static struct attribute *suniv_dma_sysfs_attrs[] = {
-        &dev_attr_dump_register.attr,
-        NULL
+    &dev_attr_channel.attr,
+    &dev_attr_dump_register.attr,
+    NULL,
 };
 
 static struct attribute_group suniv_dma_attribute_group = {
-        .attrs = suniv_dma_sysfs_attrs,
+    .attrs = suniv_dma_sysfs_attrs,
 };
 
-static inline int suniv_dma_register_sysfs(struct device *dev, struct attribute_group *attr_group)
+static inline int suniv_dma_register_sysfs(struct device *dev,
+                                           struct attribute_group *attr_group)
 {
     return sysfs_create_group(&dev->kobj, attr_group);
 }
 
-static inline void suniv_dma_unregister_sysfs(struct device *dev, struct attribute_group *attr_group)
+static inline void suniv_dma_unregister_sysfs(struct device *dev,
+                                              struct attribute_group *attr_group)
 {
     sysfs_remove_group(&dev->kobj, attr_group);
 }
@@ -687,6 +759,7 @@ static int suniv_dma_probe(struct platform_device *pdev)
 
     /* Initialize locks */
     spin_lock_init(&dma_dev->lock);
+    mutex_init(&dma_dev->mutex);
 
     /* Acquire clocks */
     dma_dev->hclk = devm_clk_get(&pdev->dev, "ahb");
