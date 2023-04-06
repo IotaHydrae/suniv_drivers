@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/reset.h>
+#include <linux/list.h>
 
 #include "virt-dma.h"
 
@@ -95,6 +96,17 @@
 #define SUNIV_DMA_SRC_ADDR_TYPE_OFFSET  5
 #define SUNIV_DMA_SRC_DRQ_TYPE_OFFSET   0
 
+/* bit field of DMA Configure Register */
+#define SUNIV_DMA_DES_DATAWIDTH(width)  ((width) << SUNIV_DMA_DES_DATAWIDTH_OFFSET)
+#define SUNIV_DMA_DES_BRUST_LEN(len)    ((len)  << SUNIV_DMA_DES_BRUST_LEN_OFFSET)
+#define SUNIV_DMA_DES_ADDR_TYPE(type)   ((type) << SUNIV_DMA_DES_ADDR_TYPE_OFFSET)
+#define SUNIV_DMA_DES_DRQ_TYPE(type)    ((type) << SUNIV_DMA_DES_DRQ_TYPE_OFFSET)
+
+#define SUNIV_DMA_SRC_DATAWIDTH(width)  ((width) << SUNIV_DMA_SRC_DATAWIDTH_OFFSET)
+#define SUNIV_DMA_SRC_BRUST_LEN(len)    ((len)  << SUNIV_DMA_SRC_BRUST_LEN_OFFSET)
+#define SUNIV_DMA_SRC_ADDR_TYPE(type)   ((type) << SUNIV_DMA_SRC_ADDR_TYPE_OFFSET)
+#define SUNIV_DMA_SRC_DRQ_TYPE(type)    ((type) << SUNIV_DMA_SRC_DRQ_TYPE_OFFSET)
+
 /* Suniv DMA direction */
 #define SUNIV_DMA_MEM_TO_MEM        0x00
 #define SUNIV_DMA_MEM_TO_DEV        0x01
@@ -108,20 +120,26 @@
 
 #define SUNIV_DMA_MAX_BURST         4
 
+#define SUNIV_DMA_DRQ_TYPE_MAX       GENMASK(4, 0)
 #define SUNIV_NDMA_BYET_CNT_MASK     GENMASK(17, 0)
 #define SUNIV_DDMA_BYET_CNT_MASK     GENMASK(24, 0)
 #define SUNIV_DDMA_DRQ_TYPE_SDRAM   0x1
 #define SUNIV_NDMA_DRQ_TYPE_SDRAM   0x11
 
 enum suniv_dma_width {
-    SUNIV_DMA_1_BYTE,
-    SUNIV_DMA_2_BYTE,
-    SUNIV_DMA_4_BYTE,
+    SUNIV_DMA_1_BYTE = 0x00,
+    SUNIV_DMA_2_BYTE = BIT(1),
+    SUNIV_DMA_4_BYTE = BIT(2),
 };
 
 enum suniv_dma_busrt_len {
-    SUNIV_DMA_BURST_1,
-    SUNIV_DMA_BURST_4,
+    SUNIV_DMA_BURST_1 = 0x00,
+    SUNIV_DMA_BURST_4 = BIT(1),
+};
+
+enum suniv_dma_addr_type {
+    SUNIV_DMA_ADDR_TYPE_LINER = 0x00,
+    SUNIV_DMA_ADDR_TYPE_IO    = BIT(1),
 };
 
 /*
@@ -138,9 +156,17 @@ struct suniv_dma_chn_hw {
     u32 cfg;
 };
 
+/*
+ * TODO: This scatter-gather need a link work list
+ * to handle dma prompts, we still need this.
+ */
+struct suniv_dma_prompt {
+    struct suniv_dma_chn_hw hw;
+    struct list_head list;
+};
+
 struct suniv_dma_diagnosis {
     u32 cid;
-
     struct suniv_dma_chn_hw reg;
 };
 
@@ -158,14 +184,14 @@ struct suniv_dma_desc {
 
 /* this struct stores everything we need for dma work */
 struct suniv_dma_chan {
-    u32 id;
-    u8 endpoint;
+    u32 id;         /* channel id */
+    u8 endpoint;    /* actually means DRQ type */
     bool is_dedicated;
     bool trans_done;
 
     struct virt_dma_chan    vchan; /* current virtual channel servicing */
     struct suniv_dma_desc   *desc;
-    struct dma_slave_config cfg;
+    struct dma_slave_config slave_cfg;  /* slave config we received */
 };
 
 struct suniv_dma {
@@ -184,8 +210,9 @@ struct suniv_dma {
     struct suniv_dma_chan   chan[SUNIV_DMA_MAX_CHANNELS];
     u32                     nr_channels;
 
-    /* for dev attr */
-    struct suniv_dma_diagnosis diag;
+    struct suniv_dma_prompt     prompts;
+
+    struct suniv_dma_diagnosis  diag;    /* for dev attr */
 };
 
 static inline u32 suniv_dma_read(struct suniv_dma *dma_dev, u32 reg)
@@ -206,6 +233,11 @@ static inline void suniv_dma_update(struct suniv_dma *dma_dev, u32 reg,
 
     tmp = (dump_val & ~mask) | val;
     writel(tmp, dma_dev->base + reg);
+}
+
+static struct device *chan2dev(struct dma_chan *chan)
+{
+    return &chan->dev->device;
 }
 
 static inline struct suniv_dma_chan *to_suniv_dma_chan(struct dma_chan *c)
@@ -444,7 +476,6 @@ static bool suniv_dma_check_trans_done(struct suniv_dma_chan *sdc)
     struct suniv_dma *dma_dev = to_suniv_dma_by_sdc(sdc);
     u32 status;
 
-    // printk("%s, checking transmit status ... \n", __func__);
     /*
      * According to the user manual, we should check the
      * bit 29 of config register of current dma channel
@@ -482,10 +513,8 @@ static irqreturn_t suniv_dma_isr(int irq, void *devid)
 
         if (bit & 1) { /* full transfer interrupt */
             printk("%s, FULL transfer interrupt\n", __func__);
-            // suniv_dma_reg_dump(chan);
         } else {    /* half transfer interrupt */
             printk("%s, HALF transfer interrupt\n", __func__);
-            // suniv_dma_reg_dump(chan);
         }
 
         spin_lock(&dma_dev->lock);
@@ -529,45 +558,80 @@ static void suniv_dma_set_chn_config(struct suniv_dma_chan *schan,
         suniv_dma_write(dma_dev, SUNIV_NDMA_CFG_REG(schan->id), hw->cfg);
     }
 
-    // suniv_dma_reg_dump(schan);
+    /*
+     * The DMA process should start soonly after filling the bit 31
+     * "DMA Loading" of channel config register
+     */
 }
 
 static void suniv_dma_start(struct suniv_dma_chan *chan)
 {
     struct suniv_dma *dma_dev = to_suniv_dma_by_sdc(chan);
+    struct suniv_dma_prompt *prompt, *n;
     struct virt_dma_desc *vdesc;
 
-    printk("%s\n", __func__);
-    if (!chan->desc) {
-        vdesc = vchan_next_desc(&chan->vchan);
-        if (!vdesc)
-            return;
+    vdesc = vchan_next_desc(&chan->vchan);
+    if (!vdesc)
+        return;
 
-        chan->desc = to_suniv_dma_desc(vdesc);
+    chan->desc = to_suniv_dma_desc(vdesc);
+
+    if (likely(list_empty(&dma_dev->prompts.list))) {
+        printk("%s, normal memcpy like process\n", __func__);
+        /* Hardware Configuration */
+        suniv_dma_set_interurpt(dma_dev, chan, 1);
+        suniv_dma_set_chn_config(chan, chan->desc);
+    } else {
+        printk("%s, it's a scatter-gather process\n", __func__);
+        /* it's a  scatter-gather process */
+        list_for_each_entry_safe(prompt, n, &dma_dev->prompts.list, list) {
+            memcpy(&chan->desc->chan_hw, &prompt->hw, sizeof(struct suniv_dma_chn_hw));
+
+            suniv_dma_set_interurpt(dma_dev, chan, 1);
+            suniv_dma_set_chn_config(chan, chan->desc);
+
+            list_del(&prompt->list);
+            kfree(prompt);
+        }
+
     }
 
-    /* Hardware Configuration */
-    suniv_dma_set_interurpt(dma_dev, chan, 1);
-    suniv_dma_set_chn_config(chan, chan->desc);
+}
+
+static int suniv_dma_config(struct dma_chan *chan,
+                            struct dma_slave_config *config)
+{
+    struct suniv_dma_chan *sdc = to_suniv_dma_chan(chan);
+
+    memcpy(&sdc->slave_cfg, config, sizeof(*config));
+
+    return 0;
 }
 
 static struct dma_chan *suniv_dma_of_xlate(struct of_phandle_args *dma_spec,
                                            struct of_dma *ofdma)
 {
-    // struct suniv_dma *dma_dev = ofdma->of_dma_data;
-    // struct suniv_dma_chan *sdc;
+    struct suniv_dma *dma_dev = ofdma->of_dma_data;
+    struct suniv_dma_chan *sdc;
     struct dma_chan *chan = NULL;
-    // u8 is_deicated = dma_spec->args[0];
-    // u8 endpoint = dma_spec->args[0];
 
-    // chan = dma_get_any_slave_channel(&dma_dev->ddev);
-    // if (!chan)
-    //     return NULL;
+    /*
+     * In deivce tree, you should fill dmas cell like blow:
+     *      dmas = <&dma 0x04>, <&dma 0x04>;
+     *
+     * Well, the 0x04 is the DRQ type needed by this node,
+     * so we should store this num temporarily for configurating
+     * the DMA channel.
+     */
+    u8 endpoint = dma_spec->args[1];
 
-    // sdc = to_suniv_dma_chan(chan);
+    chan = dma_get_any_slave_channel(&dma_dev->ddev);
+    if (!chan)
+        return NULL;
 
-    // sdc->is_dedicated = is_deicated;
-    // sdc->endpoint = endpoint;
+    sdc = to_suniv_dma_chan(chan);
+
+    sdc->endpoint = endpoint;
 
     printk("%s, %s\n", __func__, dma_spec->np->name);
     return chan;
@@ -653,9 +717,9 @@ static void suniv_dma_issue_pending(struct dma_chan *c)
     spin_unlock_irqrestore(&chan->vchan.lock, flags);
 }
 
-static struct dma_async_tx_descriptor *suniv_dma_prep_dma_memcpy(
-            struct dma_chan *c, dma_addr_t dst, dma_addr_t src,
-            size_t len, unsigned long flags)
+static struct dma_async_tx_descriptor *
+suniv_dma_prep_dma_memcpy(struct dma_chan *c, dma_addr_t dst, dma_addr_t src,
+                          size_t len, unsigned long flags)
 {
     struct suniv_dma_chn_hw *hw;
     struct suniv_dma_desc *desc;
@@ -677,6 +741,7 @@ static struct dma_async_tx_descriptor *suniv_dma_prep_dma_memcpy(
     hw->des_addr = dst;
     hw->src_addr = src;
 
+    /* check the format of data */
     if (IS_ALIGNED(len, 4)) {
         hw->datawidth = SUNIV_DMA_4_BYTE;
         hw->brust_len = SUNIV_DMA_BURST_4;
@@ -688,27 +753,125 @@ static struct dma_async_tx_descriptor *suniv_dma_prep_dma_memcpy(
         hw->brust_len = SUNIV_DMA_BURST_1;
     }
 
-    // hw->datawidth = SUNIV_DMA_1_BYTE;
-    // hw->brust_len = SUNIV_DMA_BURST_1;
-
     if (chan->is_dedicated) {
         hw->byte_cnt = len & SUNIV_DDMA_BYET_CNT_MASK;
 
         hw->cfg |= SUNIV_DDMA_DRQ_TYPE_SDRAM << SUNIV_DMA_DES_DRQ_TYPE_OFFSET;
         hw->cfg |= SUNIV_DDMA_DRQ_TYPE_SDRAM << SUNIV_DMA_SRC_DRQ_TYPE_OFFSET;
+        hw->cfg |= SUNIV_DMA_SRC_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_LINER);
+        hw->cfg |= SUNIV_DMA_DES_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_LINER);
     } else {
         hw->byte_cnt = len & SUNIV_NDMA_BYET_CNT_MASK;
 
-
         hw->cfg |= SUNIV_NDMA_DRQ_TYPE_SDRAM << SUNIV_DMA_DES_DRQ_TYPE_OFFSET;
         hw->cfg |= SUNIV_NDMA_DRQ_TYPE_SDRAM << SUNIV_DMA_SRC_DRQ_TYPE_OFFSET;
+        hw->cfg |= SUNIV_DMA_SRC_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_IO);
+        hw->cfg |= SUNIV_DMA_DES_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_IO);
     }
 
     /* Common configuration */
+    hw->cfg |= SUNIV_DMA_SRC_DATAWIDTH(hw->datawidth);
+    hw->cfg |= SUNIV_DMA_SRC_BRUST_LEN(hw->brust_len);
+
+    hw->cfg |= SUNIV_DMA_DES_DATAWIDTH(hw->datawidth);
+    hw->cfg |= SUNIV_DMA_DES_BRUST_LEN(hw->brust_len);
+
     hw->cfg |= SUNIV_DMA_REMAIN_BYTE_CNT_READ_EN;
     hw->cfg |= SUNIV_DMA_LOADING;
 
     return vchan_tx_prep(&chan->vchan, &desc->vdesc, flags);
+}
+
+static struct dma_async_tx_descriptor *
+suniv_dma_prep_slave_sg(struct dma_chan *chan,
+                        struct scatterlist *sgl,
+                        unsigned int sg_len, enum dma_transfer_direction direction,
+                        unsigned long flags, void *context)
+{
+    struct suniv_dma_chan *sdc = to_suniv_dma_chan(chan);
+    struct suniv_dma *dma_dev = to_suniv_dma_by_sdc(sdc);
+    struct dma_slave_config *slave_cfg = &sdc->slave_cfg;
+    struct suniv_dma_prompt *prompt;
+    struct suniv_dma_desc    *desc;
+    struct suniv_dma_chn_hw   *hw;
+    struct scatterlist *sg;
+    u32 len;
+    int i;
+
+    if (!sgl)
+        return NULL;
+
+    if (!is_slave_direction(direction)) {
+        dev_err(chan2dev(chan), "Invalid DMA direction\n");
+        return NULL;
+    }
+
+    desc = kzalloc(sizeof(struct suniv_dma_desc), GFP_NOWAIT);
+    if (!desc)
+        return NULL;
+
+    /* Huh, always forget save this into my channel */
+    sdc->desc = desc;
+
+    desc->dir = direction;
+    hw = &desc->chan_hw;
+
+    if (direction == DMA_MEM_TO_DEV) {
+        hw->cfg |= SUNIV_DMA_DES_DRQ_TYPE(sdc->endpoint);
+        hw->cfg |= SUNIV_DMA_DES_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_IO);
+
+        hw->cfg |= SUNIV_DMA_SRC_DRQ_TYPE(sdc->is_dedicated ?
+                                          SUNIV_DDMA_DRQ_TYPE_SDRAM : SUNIV_NDMA_DRQ_TYPE_SDRAM);
+        hw->cfg |= SUNIV_DMA_SRC_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_LINER);
+    } else {
+        hw->cfg |= SUNIV_DMA_DES_DRQ_TYPE(sdc->is_dedicated ?
+                                          SUNIV_DDMA_DRQ_TYPE_SDRAM : SUNIV_NDMA_DRQ_TYPE_SDRAM);
+        hw->cfg |= SUNIV_DMA_DES_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_LINER);
+
+        hw->cfg |= SUNIV_DMA_SRC_DRQ_TYPE(sdc->endpoint);
+        hw->cfg |= SUNIV_DMA_SRC_ADDR_TYPE(SUNIV_DMA_ADDR_TYPE_IO);
+    }
+
+    for_each_sg(sgl, sg, sg_len, i) {
+        printk("%s, prompt : %d preparing ...\n", __func__, i);
+        prompt = kzalloc(sizeof(*prompt), GFP_KERNEL);
+
+        len = sg_dma_len(sg);
+
+        if (IS_ALIGNED(len, 4))
+            hw->brust_len = SUNIV_DMA_BURST_4;
+
+        if (sdc->is_dedicated)
+            hw->byte_cnt = len & SUNIV_DDMA_BYET_CNT_MASK;
+        else
+            hw->byte_cnt = len & SUNIV_NDMA_BYET_CNT_MASK;
+
+        if (direction == DMA_MEM_TO_DEV) {
+            hw->datawidth = slave_cfg->src_addr_width;
+            hw->src_addr = sg_dma_address(sg);
+            hw->des_addr = slave_cfg->dst_addr;
+        } else {
+            hw->datawidth = slave_cfg->dst_addr_width;
+            hw->src_addr = slave_cfg->src_addr;
+            hw->des_addr = sg_dma_address(sg);
+        }
+
+        /* Common configuration */
+        hw->cfg |= SUNIV_DMA_SRC_DATAWIDTH(hw->datawidth);
+        hw->cfg |= SUNIV_DMA_SRC_BRUST_LEN(hw->brust_len);
+
+        hw->cfg |= SUNIV_DMA_DES_DATAWIDTH(hw->datawidth);
+        hw->cfg |= SUNIV_DMA_DES_BRUST_LEN(hw->brust_len);
+
+        hw->cfg |= SUNIV_DMA_REMAIN_BYTE_CNT_READ_EN;
+        hw->cfg |= SUNIV_DMA_LOADING;
+
+        memcpy(&prompt->hw, hw, sizeof(struct suniv_dma_chn_hw));
+
+        list_add_tail(&prompt->list, &dma_dev->prompts.list);
+    }
+
+    return vchan_tx_prep(&sdc->vchan, &desc->vdesc, flags);
 }
 
 static void suniv_dma_desc_free(struct virt_dma_desc *vdesc)
@@ -781,13 +944,15 @@ static int suniv_dma_probe(struct platform_device *pdev)
     }
 
     dma_cap_set(DMA_MEMCPY, dd->cap_mask);
-    // dma_cap_set(DMA_SLAVE, dd->cap_mask);
+    dma_cap_set(DMA_SLAVE, dd->cap_mask);
     dd->device_alloc_chan_resources = suniv_dma_alloc_chan_resources;
     dd->device_free_chan_resources  = suniv_dma_free_chan_reosuces;
     dd->device_terminate_all        = suniv_dma_terminate_all;
+    dd->device_config               = suniv_dma_config;
     dd->device_tx_status            = suniv_dma_tx_status;
     dd->device_issue_pending        = suniv_dma_issue_pending;
     dd->device_prep_dma_memcpy      = suniv_dma_prep_dma_memcpy;
+    dd->device_prep_slave_sg        = suniv_dma_prep_slave_sg;
 
     dd->src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
                           BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
@@ -796,10 +961,11 @@ static int suniv_dma_probe(struct platform_device *pdev)
                           BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
                           BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
     dd->directions = BIT(DMA_MEM_TO_MEM) | BIT(DMA_MEM_TO_DEV) |
-                     BIT(DMA_DEV_TO_MEM) | BIT(DMA_DEV_TO_DEV);
+                     BIT(DMA_DEV_TO_MEM);
     dd->max_burst = SUNIV_DMA_MAX_BURST;
     dd->dev = &pdev->dev;
     INIT_LIST_HEAD(&dd->channels);
+    INIT_LIST_HEAD(&dma_dev->prompts.list);
 
     for (i = 0; i < SUNIV_DMA_NDMA_NR_CHANNELS; i++) {
         chan = &dma_dev->chan[i];
